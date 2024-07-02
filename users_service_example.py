@@ -5,7 +5,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import punq
-from fastapi import Depends, FastAPI, HTTPException, Request, params, status
+from fastapi import Depends, FastAPI, Request, params
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, ValidationError
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -13,6 +14,15 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class BaseORM(DeclarativeBase): ...
+
+
+@dataclass
+class EntityValidationException(Exception):
+    errors: dict[str, str]
+
+    @classmethod
+    def from_pydantic_validation_error(cls, e: ValidationError) -> "EntityValidationException":
+        return cls(errors={error["loc"][0]: error["msg"] for error in e.errors()})
 
 
 @dataclass(kw_only=True)
@@ -30,7 +40,7 @@ class User:
                 hashed_password=self.hashed_password,
             )
         except ValidationError as e:
-            raise e
+            raise EntityValidationException.from_pydantic_validation_error(e)
 
 
 class UserValidator(BaseModel):
@@ -105,50 +115,34 @@ class SQLAlchemyUsersRepository(IUsersRepository):
 
         return user
 
-    async def get_by_id(self, id: int) -> User | None:
+    async def _get_one_or_none_from_query(self, query) -> User | None:
         async with self.session_maker() as session:
-            user = await session.get(UserORM, id)
+            result = await session.execute(query)
+
+            user = result.scalars().one_or_none()
             if not user:
                 return None
+
             return user.to_entity()
+
+    async def get_by_id(self, id: int) -> User | None:
+        return await self._get_one_or_none_from_query(select(UserORM).where(UserORM.id == id))
 
     async def get_by_email(self, email: str) -> User | None:
-        async with self.session_maker() as session:
-            stmt = select(UserORM).where(UserORM.email == email)
-            result = await session.execute(stmt)
-
-            user = result.scalars().one_or_none()
-            if not user:
-                return None
-
-            return user.to_entity()
+        return await self._get_one_or_none_from_query(select(UserORM).where(UserORM.email == email))
 
     async def get_by_username(self, username: str) -> User | None:
-        async with self.session_maker() as session:
-            stmt = select(UserORM).where(UserORM.username == username)
-            result = await session.execute(stmt)
-
-            user = result.scalars().one_or_none()
-            if not user:
-                return None
-
-            return user.to_entity()
+        return await self._get_one_or_none_from_query(select(UserORM).where(UserORM.username == username))
 
     async def get_by_username_or_email(self, username_or_email: str) -> User | None:
-        async with self.session_maker() as session:
-            stmt = select(UserORM).where(
+        return await self._get_one_or_none_from_query(
+            select(UserORM).where(
                 or_(
                     UserORM.username == username_or_email,
                     UserORM.email == username_or_email,
                 )
             )
-            result = await session.execute(stmt)
-
-            user = result.scalars().one_or_none()
-            if not user:
-                return None
-
-            return user.to_entity()
+        )
 
 
 class HashService:
@@ -156,9 +150,7 @@ class HashService:
         return hashlib.sha256(value.encode()).digest()
 
     def is_valid(self, value: str, hashed_value: bytes) -> bool:
-        if hashed_value == self.hash(value):
-            return True
-        return False
+        return hashed_value == self.hash(value)
 
 
 @dataclass
@@ -166,14 +158,27 @@ class UsersService:
     repository: IUsersRepository
     hash_service: HashService
 
-    async def create_new_user(self, create_user_dto: CreateUserDTO) -> User:
+    async def create_new_user(self, user: User) -> User:
+        return await self.repository.add(user)
+
+    def convert_from_dto_to_entity(self, create_user_dto: CreateUserDTO) -> User:
         user = User(
             email=create_user_dto.email,
             username=create_user_dto.username,
             hashed_password=self.hash_service.hash(create_user_dto.password),
         )
+        return user
+
+    async def check_if_can_be_created(self, user: User) -> None:
         user.validate()
-        return await self.repository.add(user)
+
+        existed_user = await self.repository.get_by_email(user.email)
+        if existed_user:
+            raise EmailAlreadyExists
+
+        existed_user = await self.repository.get_by_username(user.username)
+        if existed_user:
+            raise UsernameAlreadyExists
 
     async def get_user_by_email(self, email: str) -> User | None:
         user = await self.repository.get_by_email(email)
@@ -183,9 +188,7 @@ class UsersService:
         user = await self.repository.get_by_username(username)
         return user
 
-    async def get_user_by_username_or_email(
-        self, username_or_email: str
-    ) -> User | None:
+    async def get_user_by_username_or_email(self, username_or_email: str) -> User | None:
         user = await self.repository.get_by_username_or_email(username_or_email)
         return user
 
@@ -211,17 +214,11 @@ class AuthService:
     hash_service: HashService
 
     async def register(self, create_user_dto: CreateUserDTO) -> User:
-        existed_user = await self.users_service.get_user_by_email(create_user_dto.email)
-        if existed_user:
-            raise EmailAlreadyExists
+        user = self.users_service.convert_from_dto_to_entity(create_user_dto)
 
-        existed_user = await self.users_service.get_user_by_username(
-            create_user_dto.username
-        )
-        if existed_user:
-            raise UsernameAlreadyExists
+        await self.users_service.check_if_can_be_created(user)
 
-        user = await self.users_service.create_new_user(create_user_dto)
+        user = await self.users_service.create_new_user(user)
         return user
 
     async def authenticate(self, login: str, password: str) -> User:
@@ -233,32 +230,6 @@ class AuthService:
             raise InvalidCredentials
 
         return user
-
-
-class HTTPEmailAlreadyExists(HTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=status.HTTP_409_CONFLICT, detail="Email already exists"
-        )
-
-
-class HTTPUsernameAlreadyExists(HTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=status.HTTP_409_CONFLICT, detail="Username already exists"
-        )
-
-
-class HTTPUserNotFound(HTTPException):
-    def __init__(self):
-        super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-
-
-class HTTPInvalidCredentials(HTTPException):
-    def __init__(self):
-        super().__init__(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
-        )
 
 
 def get_container(request: Request) -> punq.Container:
@@ -299,9 +270,7 @@ async def init_container() -> punq.Container:
     )
 
     container.register(UsersService, scope=punq.Scope.singleton)
-    container.register(
-        IUsersRepository, SQLAlchemyUsersRepository, scope=punq.Scope.singleton
-    )
+    container.register(IUsersRepository, SQLAlchemyUsersRepository, scope=punq.Scope.singleton)
 
     container.register(AuthService, scope=punq.Scope.singleton)
 
@@ -318,9 +287,49 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(lifespan=lifespan)
 
 
+@app.exception_handler(EntityValidationException)
+async def entity_validation_exception_handler(request: Request, exc: EntityValidationException):
+    return JSONResponse(
+        status_code=422,
+        content={"errors": exc.errors},
+    )
+
+
+@app.exception_handler(UsernameAlreadyExists)
+async def username_already_exists_exception_handler(request: Request, exc: UsernameAlreadyExists):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "Username already exists"},
+    )
+
+
+@app.exception_handler(EmailAlreadyExists)
+async def email_already_exists_exception_handler(request: Request, exc: EmailAlreadyExists):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "Email already exists"},
+    )
+
+
+@app.exception_handler(UserNotFound)
+async def user_not_found_exception_handler(request: Request, exc: UserNotFound):
+    return JSONResponse(
+        status_code=404,
+        content={"detail": "User not found"},
+    )
+
+
+@app.exception_handler(InvalidCredentials)
+async def invalid_credentials_exception_handler(request: Request, exc: InvalidCredentials):
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Invalid credentials"},
+    )
+
+
 class SignUpSchema(BaseModel):
-    username: str = Field(min_length=3, max_length=50)
-    email: EmailStr
+    username: str
+    email: str
     password: str
 
 
@@ -340,18 +349,13 @@ async def sign_up(
     sign_up_schema: SignUpSchema,
     auth_service=Provide(AuthService),
 ):
-    try:
-        user = await auth_service.register(
-            CreateUserDTO(
-                username=sign_up_schema.username,
-                email=sign_up_schema.email,
-                password=sign_up_schema.password,
-            )
+    user = await auth_service.register(
+        CreateUserDTO(
+            username=sign_up_schema.username,
+            email=sign_up_schema.email,
+            password=sign_up_schema.password,
         )
-    except EmailAlreadyExists:
-        raise HTTPEmailAlreadyExists
-    except UsernameAlreadyExists:
-        raise HTTPUsernameAlreadyExists
+    )
 
     return user
 
@@ -361,14 +365,9 @@ async def sign_in(
     sign_in_schema: SignInSchema,
     auth_service=Provide(AuthService),
 ):
-    try:
-        user = await auth_service.authenticate(
-            login=sign_in_schema.login,
-            password=sign_in_schema.password,
-        )
-    except UserNotFound:
-        raise HTTPUserNotFound
-    except InvalidCredentials:
-        raise HTTPInvalidCredentials
+    user = await auth_service.authenticate(
+        login=sign_in_schema.login,
+        password=sign_in_schema.password,
+    )
 
     return user
