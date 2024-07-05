@@ -5,10 +5,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import punq
-from fastapi import Depends, FastAPI, Request, params
+from fastapi import Depends, FastAPI, Request, params, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field, ValidationError
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -22,7 +22,7 @@ class EntityValidationException(Exception):
 
     @classmethod
     def from_pydantic_validation_error(cls, e: ValidationError) -> "EntityValidationException":
-        return cls(errors={error["loc"][0]: error["msg"] for error in e.errors()})
+        return cls(errors={error["loc"][-1]: error["msg"] for error in e.errors()})
 
 
 @dataclass(kw_only=True)
@@ -93,9 +93,6 @@ class IUsersRepository(ABC):
     @abstractmethod
     async def get_by_username(self, username: str) -> User | None: ...
 
-    @abstractmethod
-    async def get_by_username_or_email(self, username_or_email: str) -> User | None: ...
-
 
 @dataclass
 class SQLAlchemyUsersRepository(IUsersRepository):
@@ -134,16 +131,6 @@ class SQLAlchemyUsersRepository(IUsersRepository):
     async def get_by_username(self, username: str) -> User | None:
         return await self._get_one_or_none_from_query(select(UserORM).where(UserORM.username == username))
 
-    async def get_by_username_or_email(self, username_or_email: str) -> User | None:
-        return await self._get_one_or_none_from_query(
-            select(UserORM).where(
-                or_(
-                    UserORM.username == username_or_email,
-                    UserORM.email == username_or_email,
-                )
-            )
-        )
-
 
 class HashService:
     def hash(self, value: str) -> bytes:
@@ -172,13 +159,18 @@ class UsersService:
     async def check_if_can_be_created(self, user: User) -> None:
         user.validate()
 
+        errors: dict[str, str] = {}
+
         existed_user = await self.repository.get_by_email(user.email)
         if existed_user:
-            raise EmailAlreadyExists
+            errors["email"] = "Email already registered"
 
         existed_user = await self.repository.get_by_username(user.username)
         if existed_user:
-            raise UsernameAlreadyExists
+            errors["username"] = "Username already taken"
+
+        if errors:
+            raise EntityValidationException(errors)
 
     async def get_user_by_email(self, email: str) -> User | None:
         user = await self.repository.get_by_email(email)
@@ -188,21 +180,8 @@ class UsersService:
         user = await self.repository.get_by_username(username)
         return user
 
-    async def get_user_by_username_or_email(self, username_or_email: str) -> User | None:
-        user = await self.repository.get_by_username_or_email(username_or_email)
-        return user
-
 
 class BaseAuthServiceException(Exception): ...
-
-
-class UsernameAlreadyExists(BaseAuthServiceException): ...
-
-
-class EmailAlreadyExists(BaseAuthServiceException): ...
-
-
-class UserNotFound(BaseAuthServiceException): ...
 
 
 class InvalidCredentials(BaseAuthServiceException): ...
@@ -222,9 +201,13 @@ class AuthService:
         return user
 
     async def authenticate(self, login: str, password: str) -> User:
-        user = await self.users_service.get_user_by_username_or_email(login)
+        if "@" in login:
+            user = await self.users_service.get_user_by_email(login)
+        else:
+            user = await self.users_service.get_user_by_username(login)
+
         if not user:
-            raise UserNotFound
+            raise InvalidCredentials
 
         if not self.hash_service.is_valid(password, user.hashed_password):
             raise InvalidCredentials
@@ -290,39 +273,15 @@ app = FastAPI(lifespan=lifespan)
 @app.exception_handler(EntityValidationException)
 async def entity_validation_exception_handler(request: Request, exc: EntityValidationException):
     return JSONResponse(
-        status_code=422,
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"errors": exc.errors},
-    )
-
-
-@app.exception_handler(UsernameAlreadyExists)
-async def username_already_exists_exception_handler(request: Request, exc: UsernameAlreadyExists):
-    return JSONResponse(
-        status_code=409,
-        content={"detail": "Username already exists"},
-    )
-
-
-@app.exception_handler(EmailAlreadyExists)
-async def email_already_exists_exception_handler(request: Request, exc: EmailAlreadyExists):
-    return JSONResponse(
-        status_code=409,
-        content={"detail": "Email already exists"},
-    )
-
-
-@app.exception_handler(UserNotFound)
-async def user_not_found_exception_handler(request: Request, exc: UserNotFound):
-    return JSONResponse(
-        status_code=404,
-        content={"detail": "User not found"},
     )
 
 
 @app.exception_handler(InvalidCredentials)
 async def invalid_credentials_exception_handler(request: Request, exc: InvalidCredentials):
     return JSONResponse(
-        status_code=401,
+        status_code=status.HTTP_401_UNAUTHORIZED,
         content={"detail": "Invalid credentials"},
     )
 
